@@ -1,17 +1,15 @@
-"""Genie Conversational API integration."""
+"""Genie Conversational API integration using Databricks SDK."""
 
 import os
-import asyncio
 import logging
-import json
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import httpx
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.dashboards import GenieMessage
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -46,256 +44,214 @@ class ChatResponse(BaseModel):
     timestamp: datetime
 
 
-def get_auth_config():
-    """Get authentication configuration for Databricks."""
-    # First try environment variables (works in Databricks Apps)
-    host = os.getenv('DATABRICKS_HOST', '').rstrip('/')
-    token = os.getenv('DATABRICKS_TOKEN')
+def get_workspace_client() -> WorkspaceClient:
+    """Get or create a Databricks Workspace Client."""
+    try:
+        # The SDK will automatically handle authentication from:
+        # 1. Environment variables (DATABRICKS_HOST, DATABRICKS_TOKEN)
+        # 2. Databricks CLI configuration
+        # 3. OAuth for Apps
+        w = WorkspaceClient()
+        logger.info(f"Workspace client initialized for host: {w.config.host}")
+        return w
+    except Exception as e:
+        logger.error(f"Failed to initialize Workspace Client: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initialize Databricks connection: {str(e)}"
+        )
 
-    # If not found, try to get from SDK
-    if not host or not token:
-        try:
-            from databricks.sdk import WorkspaceClient
-            from databricks.sdk.core import Config
 
-            # Try to get workspace client which will handle auth automatically
-            w = WorkspaceClient()
-            config = w.config
-
-            # Get host from the SDK config
-            if not host:
-                host = config.host
-
-            # Get token if we don't have it
-            if not token:
-                token = config.token
-                # In OAuth scenarios, try to get from header factory
-                if not token and hasattr(config, '_header_factory'):
-                    auth_header = config._header_factory()
-                    if auth_header and 'Authorization' in auth_header:
-                        token = auth_header['Authorization'].replace('Bearer ', '')
-
-            logger.info(f"Auth via SDK - Host: {host[:30] if host else 'None'}..., Token: {'Present' if token else 'Missing'}")
-        except Exception as e:
-            logger.warning(f"SDK auth attempt: {e}")
-
-    # Try loading from .env.local as last resort
-    if not host or not token:
-        try:
-            from dotenv import load_dotenv
-            load_dotenv('.env.local')
-            host = os.getenv('DATABRICKS_HOST', '').rstrip('/')
-            token = os.getenv('DATABRICKS_TOKEN')
-        except:
-            pass
-
-    # Ensure host has proper formatting
-    if host:
-        host = host.rstrip('/')
-        # Ensure host has https:// prefix
-        if not host.startswith('http'):
-            host = f"https://{host}"
-
-    logger.info(f"Final auth config - Host: {host[:30] if host else 'None'}..., Token: {'Present' if token else 'Missing'}")
-    return host, token
+def process_genie_message(genie_message: GenieMessage, space_id: str) -> ChatResponse:
+    """Process a GenieMessage response and extract relevant data."""
+    try:
+        conversation_id = genie_message.conversation_id
+        message_id = genie_message.id
+        status = genie_message.status.value if genie_message.status else "UNKNOWN"
+        
+        logger.info(f"Processing message {message_id} with status: {status}")
+        
+        # Initialize response data
+        sql_query = None
+        query_description = None
+        query_results = None
+        text_content = None
+        content = genie_message.content or ""
+        
+        # Process attachments if present
+        if genie_message.attachments:
+            w = get_workspace_client()
+            
+            for attachment in genie_message.attachments:
+                # Handle text attachments
+                if attachment.text:
+                    text_content = attachment.text.content or ""
+                    logger.info(f"Found text attachment: {text_content[:100]}...")
+                
+                # Handle query attachments
+                if attachment.query:
+                    sql_query = attachment.query.query or ""
+                    query_description = attachment.query.description or ""
+                    attachment_id = attachment.id
+                    
+                    logger.info(f"Found query attachment: {query_description[:100]}...")
+                    
+                    # Fetch query results using SDK
+                    if attachment_id:
+                        try:
+                            result_response = w.genie.get_message_attachment_query_result(
+                                space_id=space_id,
+                                conversation_id=conversation_id,
+                                message_id=message_id,
+                                attachment_id=attachment_id
+                            )
+                            
+                            # Extract data from response
+                            if result_response.statement_response:
+                                statement_response = result_response.statement_response
+                                
+                                # Get data
+                                data_array = []
+                                if statement_response.result and statement_response.result.data_array:
+                                    data_array = statement_response.result.data_array
+                                
+                                # Get schema
+                                columns = []
+                                column_types = []
+                                if statement_response.manifest and statement_response.manifest.schema:
+                                    schema = statement_response.manifest.schema
+                                    if schema.columns:
+                                        columns = [col.name for col in schema.columns]
+                                        column_types = [col.type_text for col in schema.columns]
+                                
+                                if columns and data_array:
+                                    query_results = {
+                                        "columns": columns,
+                                        "column_types": column_types,
+                                        "data": data_array,
+                                        "row_count": len(data_array)
+                                    }
+                                    logger.info(f"Retrieved query results: {len(data_array)} rows")
+                        
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch query results: {e}")
+        
+        # Determine response content
+        response_content = query_description or text_content or content or "Query completed successfully."
+        
+        # Map Genie status to our MessageStatus
+        if status == "COMPLETED":
+            message_status = MessageStatus.COMPLETED
+        elif status == "FAILED":
+            message_status = MessageStatus.FAILED
+        else:
+            message_status = MessageStatus.PROCESSING
+        
+        return ChatResponse(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            content=response_content,
+            status=message_status,
+            sql_query=sql_query,
+            query_results=query_results,
+            timestamp=datetime.now()
+        )
+    
+    except Exception as e:
+        logger.error(f"Error processing Genie message: {e}")
+        raise
 
 
 @router.post("/send-message", response_model=ChatResponse)
 async def send_message(message: ChatMessage):
-    """Send a message to Genie and get response."""
-
+    """Send a message to Genie and get response using Databricks SDK."""
+    
     # Get Genie Space ID
     GENIE_SPACE_ID = os.getenv('DATABRICKS_GENIE_SPACE_ID', '')
-
+    
     if not GENIE_SPACE_ID:
         logger.error("Missing Genie Space ID configuration")
         raise HTTPException(
             status_code=500,
             detail="Genie Space ID not configured. Please set DATABRICKS_GENIE_SPACE_ID."
         )
-
-    # Get authentication
-    host, token = get_auth_config()
-
-    if not host or not token:
-        logger.error(f"Missing auth - Host: {bool(host)}, Token: {bool(token)}")
+    
+    try:
+        # Get Workspace Client
+        w = get_workspace_client()
+        
+        conversation_id = message.conversation_id
+        
+        # Start new conversation or continue existing one
+        if not conversation_id:
+            logger.info("Starting new conversation with SDK")
+            
+            # Use SDK to start conversation and wait for completion
+            genie_message = w.genie.start_conversation_and_wait(
+                space_id=GENIE_SPACE_ID,
+                content=message.content,
+                timeout=timedelta(minutes=5)
+            )
+            
+            logger.info(f"Started conversation: {genie_message.conversation_id}, message: {genie_message.id}")
+        
+        else:
+            logger.info(f"Continuing conversation: {conversation_id} with SDK")
+            
+            # Use SDK to create message and wait for completion
+            genie_message = w.genie.create_message_and_wait(
+                space_id=GENIE_SPACE_ID,
+                conversation_id=conversation_id,
+                content=message.content,
+                timeout=timedelta(minutes=5)
+            )
+            
+            logger.info(f"Sent message: {genie_message.id}")
+        
+        # Process the Genie message and return response
+        return process_genie_message(genie_message, GENIE_SPACE_ID)
+    
+    except Exception as e:
+        logger.error(f"Error in Genie API: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail="Authentication not configured properly."
+            detail=f"Failed to communicate with Genie: {str(e)}"
         )
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-
-    conversation_id = message.conversation_id
-
-    async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
-        try:
-            # Start new conversation or continue existing one
-            if not conversation_id:
-                logger.info("Starting new conversation")
-                start_url = f"{host}/api/2.0/genie/spaces/{GENIE_SPACE_ID}/start-conversation"
-                payload = {"content": message.content}
-
-                logger.info(f"Calling: {start_url}")
-                response = await client.post(start_url, headers=headers, json=payload)
-
-                if response.status_code != 200:
-                    logger.error(f"Failed to start conversation: {response.status_code} - {response.text}")
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Failed to start conversation: {response.text}"
-                    )
-
-                data = response.json()
-                conversation_id = data.get("conversation_id")
-                message_id = data.get("message_id")
-                logger.info(f"Started conversation: {conversation_id}, message: {message_id}")
-
-            else:
-                logger.info(f"Continuing conversation: {conversation_id}")
-                send_url = f"{host}/api/2.0/genie/spaces/{GENIE_SPACE_ID}/conversations/{conversation_id}/messages"
-                payload = {"content": message.content}
-
-                logger.info(f"Sending message to: {send_url}")
-                response = await client.post(send_url, headers=headers, json=payload)
-
-                if response.status_code != 200:
-                    logger.error(f"Failed to send message: {response.status_code} - {response.text}")
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Failed to send message: {response.text}"
-                    )
-
-                data = response.json()
-                message_id = data.get("message_id")
-                logger.info(f"Sent message: {message_id}")
-
-            # Poll for completion
-            for attempt in range(20):
-                await asyncio.sleep(3)
-
-                status_url = f"{host}/api/2.0/genie/spaces/{GENIE_SPACE_ID}/conversations/{conversation_id}/messages/{message_id}"
-                logger.info(f"Checking status: attempt {attempt + 1}")
-
-                status_response = await client.get(status_url, headers=headers)
-
-                if status_response.status_code != 200:
-                    logger.warning(f"Status check failed: {status_response.status_code}")
-                    continue
-
-                status_data = status_response.json()
-                message_status = status_data.get("status", "")
-
-                logger.info(f"Message status: {message_status}")
-
-                if message_status == "COMPLETED":
-                    # Extract response
-                    content = status_data.get("content", "")
-                    attachments = status_data.get("attachments", [])
-
-                    sql_query = None
-                    query_description = None
-                    query_results = None
-                    text_content = None
-
-                    # Process attachments
-                    for attachment in attachments:
-                        # Handle text attachments
-                        if "text" in attachment:
-                            text_info = attachment.get("text", {})
-                            text_content = text_info.get("content", "")
-
-                        # Handle query attachments
-                        if "query" in attachment:
-                            query_info = attachment.get("query", {})
-                            sql_query = query_info.get("query", "")
-                            query_description = query_info.get("description", "")
-                            attachment_id = attachment.get("attachment_id")
-
-                            # Fetch query results
-                            if attachment_id:
-                                result_url = f"{status_url}/query-result/{attachment_id}"
-                                logger.info(f"Fetching query results from: {result_url}")
-
-                                result_response = await client.get(result_url, headers=headers)
-
-                                if result_response.status_code == 200:
-                                    result_data = result_response.json()
-
-                                    # Extract data from response
-                                    statement_response = result_data.get("statement_response", {})
-                                    result_section = statement_response.get("result", {})
-                                    data_array = result_section.get("data_array", [])
-
-                                    manifest = statement_response.get("manifest", {})
-                                    schema = manifest.get("schema", {})
-                                    columns = schema.get("columns", [])
-
-                                    if columns and data_array:
-                                        query_results = {
-                                            "columns": [col.get("name") for col in columns],
-                                            "column_types": [col.get("type_text") for col in columns],
-                                            "data": data_array,
-                                            "row_count": len(data_array)
-                                        }
-
-                    # Determine response content
-                    response_content = query_description or text_content or content or "Query completed successfully."
-
-                    return ChatResponse(
-                        conversation_id=conversation_id,
-                        message_id=message_id,
-                        content=response_content,
-                        status=MessageStatus.COMPLETED,
-                        sql_query=sql_query,
-                        query_results=query_results,
-                        timestamp=datetime.now()
-                    )
-
-                elif message_status == "FAILED":
-                    error_msg = status_data.get("error", "Request failed")
-                    logger.error(f"Message failed: {error_msg}")
-                    return ChatResponse(
-                        conversation_id=conversation_id,
-                        message_id=message_id,
-                        content=f"Error: {error_msg}",
-                        status=MessageStatus.FAILED,
-                        timestamp=datetime.now()
-                    )
-
-            # Timeout
-            return ChatResponse(
-                conversation_id=conversation_id,
-                message_id=message_id,
-                content="Request timed out. Please try again.",
-                status=MessageStatus.PROCESSING,
-                timestamp=datetime.now()
-            )
-
-        except Exception as e:
-            logger.error(f"Error in Genie API: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to communicate with Genie: {str(e)}"
-            )
 
 
 @router.get("/health")
 async def health_check():
-    """Check Genie API configuration."""
+    """Check Genie API configuration using Databricks SDK."""
     try:
-        host, token = get_auth_config()
-        configured = bool(os.getenv('DATABRICKS_GENIE_SPACE_ID')) and bool(token) and bool(host)
-
-        return {
-            "status": "healthy" if configured else "not_configured",
-            "configured": configured,
-            "space_id": os.getenv('DATABRICKS_GENIE_SPACE_ID', '')[:8] + "..." if os.getenv('DATABRICKS_GENIE_SPACE_ID') else None,
-            "host": host[:30] + "..." if host else None
-        }
+        w = get_workspace_client()
+        space_id = os.getenv('DATABRICKS_GENIE_SPACE_ID', '')
+        
+        # Try to get the Genie space to verify configuration
+        if space_id:
+            try:
+                space = w.genie.get_space(space_id=space_id)
+                return {
+                    "status": "healthy",
+                    "configured": True,
+                    "space_id": space_id[:8] + "..." if space_id else None,
+                    "space_name": space.name if space else None,
+                    "host": w.config.host[:30] + "..." if w.config.host else None
+                }
+            except Exception as e:
+                logger.warning(f"Failed to verify Genie space: {e}")
+                return {
+                    "status": "space_not_accessible",
+                    "configured": True,
+                    "space_id": space_id[:8] + "..." if space_id else None,
+                    "host": w.config.host[:30] + "..." if w.config.host else None,
+                    "error": str(e)
+                }
+        else:
+            return {
+                "status": "not_configured",
+                "configured": False,
+                "error": "DATABRICKS_GENIE_SPACE_ID not set"
+            }
     except Exception as e:
         return {
             "status": "error",
